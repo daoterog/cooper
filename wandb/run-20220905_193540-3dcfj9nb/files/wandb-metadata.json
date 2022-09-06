@@ -1,0 +1,24 @@
+{
+    "os": "Windows-10-10.0.22000-SP0",
+    "python": "3.7.13",
+    "heartbeatAt": "2022-09-06T00:35:43.000970",
+    "startedAt": "2022-09-06T00:35:40.226765",
+    "docker": null,
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+    "gpu_count": 1,
+    "cpu_count": 8,
+    "cuda": null,
+    "args": [],
+    "state": "running",
+    "program": "c:\\Users\\danie\\Documents\\daniel\\universidad\\9no_semestre\\practica_investigativa\\cooper\\tutorials\\ridge_logistic_regression\\experimentation.py",
+    "codePath": "tutorials\\ridge_logistic_regression\\experimentation.py",
+    "git": {
+        "remote": "https://github.com/daoterog/cooper.git",
+        "commit": "5a01dcb9703e2304be558b52fdc5267e8f290c90"
+    },
+    "email": "doterog320@gmail.com",
+    "root": "C:/Users/danie/Documents/daniel/universidad/9no_semestre/practica_investigativa/cooper",
+    "host": "LAPTOP-FFE8REUH",
+    "username": "danie",
+    "executable": "C:\\Users\\danie\\miniconda3\\envs\\cooper_toy\\python.exe"
+}

@@ -1,0 +1,23 @@
+{
+    "os": "Windows-10-10.0.22000-SP0",
+    "python": "3.7.13",
+    "heartbeatAt": "2022-09-05T23:04:05.315184",
+    "startedAt": "2022-09-05T23:04:04.426596",
+    "docker": null,
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+    "gpu_count": 1,
+    "cpu_count": 8,
+    "cuda": null,
+    "args": null,
+    "state": "running",
+    "program": "<python with no main file>",
+    "git": {
+        "remote": "https://github.com/daoterog/cooper.git",
+        "commit": "5a01dcb9703e2304be558b52fdc5267e8f290c90"
+    },
+    "email": "doterog320@gmail.com",
+    "root": "C:/Users/danie/Documents/daniel/universidad/9no_semestre/practica_investigativa/cooper",
+    "host": "LAPTOP-FFE8REUH",
+    "username": "danie",
+    "executable": "c:\\Users\\danie\\miniconda3\\envs\\cooper_toy\\python.exe"
+}
