@@ -272,7 +272,7 @@ def evaluate_model(
         total, correct = 0, 0
         for inputs, targets in data_loader:
             pred_logits = model.forward(inputs)
-            predicted = pred_logits > 0.5
+            predicted = pred_logits.argmax(dim=1)
             total += targets.size(0)
             correct += (predicted == targets).sum().item()
     if use_wandb:

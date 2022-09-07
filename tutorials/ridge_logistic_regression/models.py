@@ -16,6 +16,7 @@ class LogisticRegression(torch.nn.Module):
             output_size (int): The size of the output.
         """
         super(LogisticRegression, self).__init__()
+        self.input_size = input_size
         self.linear = torch.nn.Linear(input_size, output_size)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -25,18 +26,19 @@ class LogisticRegression(torch.nn.Module):
         Returns:
             torch.Tensor: The output of the model.
         """
-        return torch.sigmoid(self.linear(inputs)).squeeze()
+        return self.linear(inputs.view(-1, self.input_size))
 
 class NormConstrainedLogisticRegression(cooper.ConstrainedMinimizationProblem):
 
     """Norm-constrained Logistic Regression model."""
 
     def __init__(self):
-        self.criterion = torch.nn.BCELoss()
+        self.criterion = torch.nn.CrossEntropyLoss()
         super().__init__(is_constrained=True)
 
     def closure(
-        self,model: torch.nn.Module,
+        self,
+        model: torch.nn.Module,
         inputs: torch.Tensor,
         targets: torch.Tensor,
         k: float,
@@ -50,7 +52,7 @@ class NormConstrainedLogisticRegression(cooper.ConstrainedMinimizationProblem):
         Returns:
             cooper.CMPState: The state of the CMP.
         """
-        pred_logits = model.forward(inputs).squeeze()
+        pred_logits = model.forward(inputs)
         loss = self.criterion(pred_logits, targets)
         ineq_defect = torch.sum(torch.pow(model.linear.weight, 2)) - k
         return cooper.CMPState(loss=loss, ineq_defect=ineq_defect)
