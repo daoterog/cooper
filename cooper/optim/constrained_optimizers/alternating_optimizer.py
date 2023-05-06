@@ -1,140 +1,183 @@
 # coding: utf8
 """
-Implementation of the :py:class:`AlternatingConstrainedOptimizer` class.
+Implementation of the :py:class:`AlternatingPrimalDualOptimizer` and
+:py:class:`AlternatingPrimalDualOptimizer` classes.
 """
 
-from typing import Callable, List, Optional, Union
+from typing import Callable, Optional
 
 import torch
 
-from cooper.cmp import CMPState
+from cooper.cmp import CMPState, LagrangianStore
 from cooper.constraints import ConstraintGroup
+from cooper.multipliers import MULTIPLIER_TYPE
+from cooper.utils import OneOrSequence
 
+from ..types import AlternatingType
 from .constrained_optimizer import ConstrainedOptimizer
 
 
-class AlternatingConstrainedOptimizer(ConstrainedOptimizer):
+class AlternatingPrimalDualOptimizer(ConstrainedOptimizer):
+    """Optimizes a :py:class:`~cooper.problem.ConstrainedMinimizationProblem`
+    by performing primal-dual alternating updates to the primal and dual variables.
+    """
+
+    # TODO(gallego-posada): Add equations to illustrate the alternating update
+
     extrapolation = False
-    alternating = True
+    alternating = AlternatingType.PRIMAL_DUAL
 
     def __init__(
         self,
-        constraint_groups: Union[List[ConstraintGroup], ConstraintGroup],
-        primal_optimizers: Union[List[torch.optim.Optimizer], torch.optim.Optimizer],
-        dual_optimizers: Union[List[torch.optim.Optimizer], torch.optim.Optimizer],
+        primal_optimizers: OneOrSequence[torch.optim.Optimizer],
+        dual_optimizers: OneOrSequence[torch.optim.Optimizer],
+        multipliers: Optional[OneOrSequence[MULTIPLIER_TYPE]] = None,
+        constraint_groups: Optional[OneOrSequence[ConstraintGroup]] = None,
     ):
-        super().__init__(constraint_groups, primal_optimizers, dual_optimizers)
+        super().__init__(primal_optimizers, dual_optimizers, multipliers, constraint_groups)
 
         self.base_sanity_checks()
 
-    def step(
+    def step(self):
+        pass
+
+    def roll(
         self,
-        closure: Optional[Callable[..., CMPState]] = None,
-        *closure_args,
-        defect_fn: Optional[Callable[..., CMPState]] = None,
-        **closure_kwargs,
-    ):
-        """
-        Performs a single optimization step on both the primal and dual
-        variables.
+        compute_cmp_state_fn: Callable[..., CMPState],
+        compute_violations_fn: Optional[Callable[..., CMPState]] = None,
+        return_multipliers: bool = False,
+    ) -> tuple[CMPState, LagrangianStore]:
+        """Performs a primal-dual alternating step where the primal variables are
+        updated first, and the dual variables are updated based on the constraint
+        violations at the updated primal point.
+
+        Note that the constraint violations are computed twice: once for the initial
+        primal update, and once more for the dual update. The second computation can
+        exploit the fact that the objective function does not need to be re-evaluated,
+        and so the computation can be sped up by only computing the constraint
+        violations through the `compute_violations_fn` argument.
 
         Args:
-            closure: Closure ``Callable`` required for re-evaluating the
-                objective and constraints when performing alternating updates.
-                Defaults to None.
+            compute_cmp_state_fn: ``Callable`` for evaluating the CMPState.
 
-            *closure_args: Arguments to be passed to the closure function
-                when re-evaluating.
+            compute_violations_fn: ``Callable`` for re-evaluating the constraint
+                violations when performing alternating updates. When this argument
+                is provided, it takes precedence over the `compute_cmp_state_fn` for
+                the update of the dual variables. If not provided, the violation
+                measured by `compute_cmp_state_fn` are used. Defaults to None.
 
-            **closure_kwargs: Keyword arguments to be passed to the closure
-                function when re-evaluating.
+            return_multipliers: When `True`, we return the updated value of the
+                multipliers for the observed constraints.
         """
 
-        if (closure is None) and (defect_fn is None):
-            raise RuntimeError("At least one of closure or defect_fn must be provided for alternating updates.")
-
+        # Update primal variables only
+        self.zero_grad()
+        cmp_state = compute_cmp_state_fn()
+        lagrangian_store = cmp_state.populate_lagrangian(return_multipliers=False)
+        cmp_state.primal_backward()
         for primal_optimizer in self.primal_optimizers:
             primal_optimizer.step()
 
-        alternate_cmp_state = self.populate_alternating_dual_gradient(
-            closure, defect_fn, *closure_args, **closure_kwargs
-        )
+        # Update dual variables based on constraint violations at new primal point
+        self.zero_grad()
+        with torch.no_grad():
+            # Note that the dual variables do not intervene in the computation of the
+            # CMP state. This means we can skip gradient computation wrt the primal
+            # parameters to avoid wasteful computation, since we only need the gradient
+            # wrt the dual variables.
+            # Also note that the call to compute_violations_fn might _not_ have
+            # populated the loss.
+            if compute_violations_fn is not None:
+                new_cmp_state = compute_violations_fn()
 
-        self.dual_step()
+                if new_cmp_state.loss is not None:
+                    raise RuntimeError("Expected `compute_violations_fn` to not populate the loss.")
 
-        return alternate_cmp_state
+                # We copy the loss evaluated during the primal update so users can
+                # access it for logging purposes.
+                if new_cmp_state.misc is None:
+                    new_cmp_state.misc = {}
+                new_cmp_state.misc["previous_loss"] = cmp_state.loss.item()
 
-    def populate_alternating_dual_gradient(
+            else:
+                new_cmp_state = compute_cmp_state_fn()
+
+            if new_cmp_state._dual_lagrangian is not None:
+                error_message = (
+                    "Expected a fresh CMP state for alternating update but the provided state has a non-None value"
+                    " for the `_dual_lagrangian` attribute."
+                )
+                raise RuntimeError(error_message)
+
+        lagrangian_store_post_primal_update = new_cmp_state.populate_lagrangian(return_multipliers=return_multipliers)
+        new_cmp_state.dual_backward()
+        self.dual_step(call_extrapolation=False)
+
+        # Purge the primal lagrangian to avoid reusing it in the next primal update
+        new_cmp_state.purge_lagrangian(purge_primal=True, purge_dual=False)
+
+        return new_cmp_state, lagrangian_store_post_primal_update
+
+
+class AlternatingDualPrimalOptimizer(ConstrainedOptimizer):
+    """Optimizes a :py:class:`~cooper.problem.ConstrainedMinimizationProblem`
+    by performing dual-primal alternating updates to the primal and dual variables.
+    """
+
+    # TODO(gallego-posada): Add equations to illustrate the alternating update
+
+    extrapolation = False
+    alternating = AlternatingType.PRIMAL_DUAL
+
+    def __init__(
         self,
-        closure: Optional[Callable[..., CMPState]] = None,
-        *closure_args,
-        defect_fn: Optional[Callable[..., CMPState]] = None,
-        **closure_kwargs,
+        primal_optimizers: OneOrSequence[torch.optim.Optimizer],
+        dual_optimizers: OneOrSequence[torch.optim.Optimizer],
+        multipliers: Optional[OneOrSequence[MULTIPLIER_TYPE]] = None,
+        constraint_groups: Optional[OneOrSequence[ConstraintGroup]] = None,
     ):
-        # TODO(juan43ramirez): rename alternate_cmp_state to something more informative.
+        super().__init__(primal_optimizers, dual_optimizers, multipliers, constraint_groups)
 
-        # Zero-out gradients for dual variables since they were already populated. We
-        # also zero-out primal gradients for safety although not really necessary.
+        self.base_sanity_checks()
+
+    def step(self):
+        pass
+
+    def roll(
+        self, compute_cmp_state_fn: Callable[..., CMPState], return_multipliers: bool = False
+    ) -> tuple[CMPState, LagrangianStore]:
+        """Performs a dual-primal alternating step where the dual variables are
+        updated first, and the primal variables are updated based on the Lagrangian
+        computed at the updated dual point. Note that the objective function and
+        constraint violations are only computed once, since the primal variables do not
+        change during the dual update.
+
+        Args:
+            compute_cmp_state_fn: ``Callable`` for evaluating the CMPState.
+
+            return_multipliers: When `True`, we return the updated value of the
+                multipliers for the observed constraints.
+        """
         self.zero_grad()
 
-        # Once having updated the primal parameters, re-compute gradient wrt
-        # multipliers. Skip gradient wrt primal parameters to avoid wasteful
-        # computation, as we only need gradient wrt multipliers.
-        with torch.no_grad():
-            assert closure is not None or defect_fn is not None
+        # This cmp_state is shared for both the dual and primal updates
+        cmp_state = compute_cmp_state_fn()
 
-            if defect_fn is not None:
-                alternate_cmp_state = defect_fn(*closure_args, **closure_kwargs)
+        # Update dual variables only
+        lagrangian_store = cmp_state.populate_lagrangian(return_multipliers=False)
+        cmp_state.dual_backward()
+        self.dual_step(call_extrapolation=False)
 
-                if alternate_cmp_state.loss is None:
-                    # Store a placeholder loss which does not contribute to the Lagrangian
-                    alternate_cmp_state.loss = 0.0
+        # Update primal variables based on the Lagrangian at the new dual point, and the
+        # objective and constraint violations measured at the old primal point.
+        self.zero_grad()
+        # Purge primal Lagrangian which was populated during the dual update
+        cmp_state.purge_lagrangian(purge_primal=True, purge_dual=False)
+        lagrangian_store_post_dual_step = cmp_state.populate_lagrangian(return_multipliers=return_multipliers)
+        cmp_state.primal_backward()
+        for primal_optimizer in self.primal_optimizers:
+            primal_optimizer.step()
+        # Purge the dual lagrangian to avoid reusing it in the next dual update
+        cmp_state.purge_lagrangian(purge_primal=False, purge_dual=True)
 
-            elif closure is not None:
-                alternate_cmp_state = closure(*closure_args, **closure_kwargs)
-
-        # We have already computed the new CMP state with the new values of the
-        # parameters. Now we only need to recalculate the Lagrangian so we can get the
-        # gradients wrt the multipliers.
-        #
-        # Note that the call to defect_fn might _not_ have populated the loss.
-        # This is not a problem since we only need to compute the gradient wrt
-        # the multipliers.
-        _ = alternate_cmp_state.populate_lagrangian()
-
-        # We only want to compute the gradients for the dual variables
-        alternate_cmp_state.dual_backward()
-
-        return alternate_cmp_state
-
-    def dual_step(self):
-        # TODO(juan43ramirez): this function is exactly the same as SimultaneousOptimizer.dual_step.
-
-        for constraint, dual_optimizer in zip(self.constraint_groups, self.dual_optimizers):
-            # TODO(juan43ramirez): which convention will we use to access the gradient
-            # of the multipliers?
-            _multiplier = constraint.multiplier
-
-            if _multiplier.weight.grad is not None:
-                # Flip gradients for multipliers to perform ascent.
-                # We only do the flipping *right before* applying the optimizer step to
-                # avoid accidental double sign flips.
-                _multiplier.weight.grad.mul_(-1.0)
-
-                # Update multipliers based on current constraint violations (gradients)
-                dual_optimizer.step()
-
-                # Select the indices of multipliers corresponding to feasible constraints
-                if _multiplier.implicit_constraint_type == "ineq":
-                    # TODO(juan43ramirez): could alternatively access the state of the
-                    # constraint, which would be more transparent.
-
-                    # Feasibility is attained when the violation is negative. Given that
-                    # the gradient sign is flipped, a negative violation corresponds to
-                    # a positive gradient.
-                    feasible_indices = _multiplier.weight.grad > 0.0
-                else:
-                    # TODO(juan43ramirez): add comment
-                    feasible_indices = None
-
-                _multiplier.post_step_(feasible_indices, restart_value=0.0)
+        return cmp_state, lagrangian_store_post_dual_step

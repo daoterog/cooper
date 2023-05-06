@@ -1,18 +1,30 @@
 import abc
-from typing import Iterable, List, Optional, Tuple
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Optional, Tuple, Union
 
 import torch
 
-from cooper.constraints import ConstraintGroup, ConstraintState
+from cooper.constraints import ConstraintGroup, ConstraintState, observed_constraints_iterator
 
 # Formulation, and some other classes below, are heavily inspired by the design of the
 # TensorFlow Constrained Optimization (TFCO) library:
 # https://github.com/google-research/tensorflow_constrained_optimization
 
 
+@dataclass
+class LagrangianStore:
+    """Stores the value of the (primal) Lagrangian, the dual Lagrangian, as well as the
+    values of the observed multipliers."""
+
+    lagrangian: torch.Tensor
+    dual_lagrangian: Optional[torch.Tensor] = None
+    observed_multipliers: Optional[list[torch.Tensor]] = None
+
+
 class CMPState:
-    """Represents the "state" of a Constrained Minimization Problem in terms of the
-    value of its loss and constraint violations/defects.
+    """Represents the state of a Constrained Minimization Problem in terms of the value
+    of its loss and constraint violations/defects.
 
     Args:
         loss: Value of the loss or main objective to be minimized :math:`f(x)`
@@ -31,7 +43,7 @@ class CMPState:
     def __init__(
         self,
         loss: Optional[torch.Tensor] = None,
-        observed_constraints: Iterable[Tuple[ConstraintGroup, Optional[ConstraintState]]] = (),
+        observed_constraints: Union[Sequence[ConstraintGroup], Sequence[Tuple[ConstraintGroup, ConstraintState]]] = (),
         misc: Optional[dict] = None,
     ):
         self.loss = loss
@@ -41,13 +53,11 @@ class CMPState:
         self._primal_lagrangian = None
         self._dual_lagrangian = None
 
-    def populate_lagrangian(
-        self, return_multipliers: bool = False
-    ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
-        """
-        Computes and accumulates the Lagrangian based on the loss and the contributions
-        to the "primal" and "dual" Lagrangians resulting from each of the observed
-        constraints.
+    def populate_lagrangian(self, return_multipliers: bool = False) -> LagrangianStore:
+        """Computes and accumulates the Lagrangian based on the loss and the
+        contributions to the "primal" and "dual" Lagrangians resulting from each of the
+        observed constraints.
+
         The Lagrangian contributions correspond to disjoint computational graphs from
         the point of view of gradient propagation: there is no gradient connection
         between the primal (resp. dual) Lagrangian contribution and the dual (resp.
@@ -64,43 +74,65 @@ class CMPState:
                 of the multiplier for each of the observed_constraints.
         """
 
-        primal_lagrangian = self.loss
-        dual_lagrangian = 0.0
+        # Check if any of the observed constraints will contribute to the primal and
+        # dual Lagrangians
+        any_primal_contribution = False
+        any_dual_contribution = False
+        for constraint_group, constraint_state in observed_constraints_iterator(self.observed_constraints):
+            if not constraint_state.skip_dual_contribution:
+                any_dual_contribution = True
+            if not constraint_state.skip_primal_contribution:
+                any_primal_contribution = True
 
-        if return_multipliers:
-            observed_multiplier_values = []
+        if self.loss is None and not any_primal_contribution:
+            # No loss provided, and no observed constraints will contribute to the
+            # primal Lagrangian.
+            primal_lagrangian = None
+        else:
+            # Either a loss was provided, or at least one observed constraint will
+            # contribute to the primal Lagrangian.
+            primal_lagrangian = 0.0 if self.loss is None else torch.clone(self.loss)
 
-        for constraint_tuple in self.observed_constraints:
-            if isinstance(constraint_tuple, ConstraintGroup):
-                constraint_group = constraint_tuple
-                constraint_state = constraint_group.state
-            elif isinstance(constraint_tuple, tuple) and len(constraint_tuple) == 2:
-                constraint_group, constraint_state = constraint_tuple
-            else:
-                error_message = f"Received invalid format for observed constraint. Expected {ConstraintGroup} or"
-                error_message += f" {Tuple[ConstraintGroup, ConstraintState]}, but received {type(constraint_tuple)}"
-                raise ValueError(error_message)
+        dual_lagrangian = 0.0 if any_dual_contribution else None
 
+        observed_multiplier_values = []
+
+        for constraint_group, constraint_state in observed_constraints_iterator(self.observed_constraints):
             multiplier_value, primal_contribution, dual_contribution = constraint_group.compute_lagrangian_contribution(
                 constraint_state=constraint_state
             )
 
-            primal_lagrangian += primal_contribution
-            dual_lagrangian += dual_contribution
+            if not constraint_state.skip_primal_contribution:
+                primal_lagrangian += primal_contribution
+            if not constraint_state.skip_dual_contribution:
+                dual_lagrangian += dual_contribution
 
             if return_multipliers:
                 observed_multiplier_values.append(multiplier_value)
 
-        previous_primal_lagrangian = 0.0 if self._primal_lagrangian is None else self._primal_lagrangian
-        self._primal_lagrangian = primal_lagrangian + previous_primal_lagrangian
+        if primal_lagrangian is not None:
+            # Either a loss was provided, or at least one observed constraint
+            # contributed to the primal Lagrangian.
+            previous_primal_lagrangian = 0.0 if self._primal_lagrangian is None else self._primal_lagrangian
+            self._primal_lagrangian = primal_lagrangian + previous_primal_lagrangian
 
-        previous_dual_lagrangian = 0.0 if self._dual_lagrangian is None else self._dual_lagrangian
-        self._dual_lagrangian = dual_lagrangian + previous_dual_lagrangian
+        if dual_lagrangian is not None:
+            # Some observed constraints contributed to the dual Lagrangian
+            previous_dual_lagrangian = 0.0 if self._dual_lagrangian is None else self._dual_lagrangian
+            self._dual_lagrangian = dual_lagrangian + previous_dual_lagrangian
 
+        lagrangian_store = LagrangianStore(lagrangian=self._primal_lagrangian, dual_lagrangian=self._dual_lagrangian)
         if return_multipliers:
-            return self._primal_lagrangian, observed_multiplier_values
-        else:
-            return self._primal_lagrangian
+            lagrangian_store.observed_multipliers = observed_multiplier_values
+
+        return lagrangian_store
+
+    def purge_lagrangian(self, purge_primal: bool, purge_dual: bool) -> None:
+        """Purge the accumulated Lagrangian contributions."""
+        if purge_primal:
+            self._primal_lagrangian = None
+        if purge_dual:
+            self._dual_lagrangian = None
 
     def primal_backward(self) -> None:
         """Triggers backward calls to compute the gradient of the Lagrangian with
@@ -108,11 +140,17 @@ class CMPState:
         if self._primal_lagrangian is not None and isinstance(self._primal_lagrangian, torch.Tensor):
             self._primal_lagrangian.backward()
 
+        # After completing the backward call, we purge the accumulated _primal_lagrangian
+        self.purge_lagrangian(purge_primal=True, purge_dual=False)
+
     def dual_backward(self) -> None:
         """Triggers backward calls to compute the gradient of the Lagrangian with
         respect to the dual variables."""
         if self._dual_lagrangian is not None and isinstance(self._dual_lagrangian, torch.Tensor):
             self._dual_lagrangian.backward()
+
+        # After completing the backward call, we purge the accumulated _dual_lagrangian
+        self.purge_lagrangian(purge_primal=False, purge_dual=True)
 
     def backward(self) -> None:
         """Computes the gradient of the Lagrangian with respect to both the primal and
@@ -122,7 +160,7 @@ class CMPState:
 
 
 class ConstrainedMinimizationProblem(abc.ABC):
-    """Base class for constrained minimization problems."""
+    """Template for constrained minimization problems."""
 
     def __init__(self):
         self._state = CMPState()
@@ -137,8 +175,7 @@ class ConstrainedMinimizationProblem(abc.ABC):
 
     @abc.abstractmethod
     def compute_cmp_state(self, *args, **kwargs) -> CMPState:
-        """
-        Computes the state of the CMP based on the current value of the primal
+        """Computes the state of the CMP based on the current value of the primal
         parameters.
 
         The signature of this abstract function may be changed to accommodate situations
@@ -154,9 +191,8 @@ class ConstrainedMinimizationProblem(abc.ABC):
         """
 
     def compute_violations(self) -> CMPState:
-        """
-        Computes the violation of (a subset of) the constraints of the CMP based on the
-        current value of the primal parameters. This function returns a
+        """Computes the violation of (a subset of) the constraints of the CMP based on
+        the current value of the primal parameters. This function returns a
         :py:class:`cooper.problem.CMPState` collecting the values of the observed
         constraints. Note that the returned ``CMPState`` may have ``loss=None`` since,
         by design, the value of the loss is not necessarily computed when evaluating

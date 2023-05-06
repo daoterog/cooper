@@ -1,61 +1,37 @@
 # coding: utf8
 """
-Implementation of the :py:class:`SimultaneousConstrainedOptimizer` class.
+Implementation of the :py:class:`SimultaneousOptimizer` class.
 """
 
-from typing import List, Union
+from typing import Callable, Optional
 
 import torch
 
+from cooper.cmp import CMPState, LagrangianStore
 from cooper.constraints import ConstraintGroup
-from cooper.multipliers import ExplicitMultiplier
+from cooper.multipliers import MULTIPLIER_TYPE
+from cooper.utils import OneOrSequence
 
+from ..types import AlternatingType
 from .constrained_optimizer import ConstrainedOptimizer
 
 
-class SimultaneousConstrainedOptimizer(ConstrainedOptimizer):
-    """
-    Optimizes a :py:class:`~cooper.problem.ConstrainedMinimizationProblem`
-    given a provided :py:class:`~cooper.formulation.Formulation`.
-
-    A ``ConstrainedOptimizer`` includes one or more
-    :class:`torch.optim.Optimizer`\\s for the primal variables. It also includes
-    a :class:`torch.optim.Optimizer` for the dual variables associated with the
-    provided ``Formulation``.
-
-    Args:
-        formulation: ``Formulation`` of the ``ConstrainedMinimizationProblem``
-            to be optimized.
-
-        primal_optimizers: Fully instantiated ``torch.optim.Optimizer``\\s used
-            to optimize the primal parameters (e.g. model parameters). The primal
-            parameters can be partitioned into multiple optimizers, in this case
-            ``primal_optimizers`` accepts a list of ``torch.optim.Optimizer``\\s.
-
-        dual_optimizer: Partially instantiated ``torch.optim.Optimizer``
-            used to optimize the dual variables (e.g. Lagrange multipliers).
-
-        dual_scheduler: Partially instantiated
-            ``torch.optim.lr_scheduler._LRScheduler`` used to schedule the
-            learning rate of the dual variables. Defaults to None.
-
-        dual_restarts: If True, perform "restarts" on the Lagrange
-            multipliers associated with inequality constraints: whenever the
-            constraint is satisfied, directly set the multiplier to zero.
-            Defaults to False.
-
+class SimultaneousOptimizer(ConstrainedOptimizer):
+    """Optimizes a :py:class:`~cooper.problem.ConstrainedMinimizationProblem`
+    by performing simultaneous gradient updates to the primal and dual variables.
     """
 
     extrapolation = False
-    alternating = False
+    alternating = AlternatingType.FALSE
 
     def __init__(
         self,
-        constraint_groups: Union[List[ConstraintGroup], ConstraintGroup],
-        primal_optimizers: Union[List[torch.optim.Optimizer], torch.optim.Optimizer],
-        dual_optimizers: Union[List[torch.optim.Optimizer], torch.optim.Optimizer],
+        primal_optimizers: OneOrSequence[torch.optim.Optimizer],
+        dual_optimizers: OneOrSequence[torch.optim.Optimizer],
+        multipliers: Optional[OneOrSequence[MULTIPLIER_TYPE]] = None,
+        constraint_groups: Optional[OneOrSequence[ConstraintGroup]] = None,
     ):
-        super().__init__(constraint_groups, primal_optimizers, dual_optimizers)
+        super().__init__(primal_optimizers, dual_optimizers, multipliers, constraint_groups)
 
         self.base_sanity_checks()
 
@@ -65,40 +41,25 @@ class SimultaneousConstrainedOptimizer(ConstrainedOptimizer):
         for primal_optimizer in self.primal_optimizers:
             primal_optimizer.step()
 
-        self.dual_step()
+        self.dual_step(call_extrapolation=False)
 
-    def dual_step(self):
-        # FIXME(juan43ramirez): do not couple the constraint groups with the
-        # dual_optimizers. Ensure that sanity_checks allow for different number of each
+    def roll(
+        self, compute_cmp_state_fn: Callable[..., CMPState], return_multipliers: bool = False
+    ) -> tuple[CMPState, LagrangianStore]:
+        """Evaluates the CMPState and performs a simultaneous step on the primal and
+        dual variables.
 
-        for constraint in self.constraint_groups:
-            for param in constraint.multiplier.parameters():
-                if param.grad is not None:
-                    # Flip gradients for multipliers to perform ascent.
-                    # We only do the flipping *right before* applying the optimizer step to
-                    # avoid accidental double sign flips.
-                    param.grad.mul_(-1.0)
+        Args:
+            compute_cmp_state_fn: ``Callable`` for evaluating the CMPState.
 
-        for dual_optimizer in self.dual_optimizers:
-            # Update multipliers based on current constraint violations (gradients)
-            # For unobserved constraints the gradient is None, so this is a no-op.
-            dual_optimizer.step()
+            return_multipliers: When `True`, we return the updated value of the
+                multipliers for the observed constraints.
+        """
 
-        for constraint in self.constraint_groups:
-            multiplier = constraint.multiplier
+        self.zero_grad()
+        cmp_state = compute_cmp_state_fn()
+        lagrangian_store = cmp_state.populate_lagrangian(return_multipliers=return_multipliers)
+        cmp_state.backward()
+        self.step()
 
-            if isinstance(multiplier, ExplicitMultiplier):
-                if multiplier.weight.grad is not None:
-                    feasible_indices = None
-                    if multiplier.implicit_constraint_type == "ineq":
-                        # Select the indices of multipliers corresponding to feasible constraints
-
-                        # Feasibility is attained when the violation is negative. Given that
-                        # the gradient sign is flipped, a negative violation corresponds to
-                        # a positive gradient.
-                        feasible_indices = multiplier.weight.grad > 0.0
-
-                        # TODO(juan43ramirez): Document https://github.com/cooper-org/cooper/issues/28
-                        # about the pitfalls of using dual_restars with stateful optimizers.
-
-                        multiplier.post_step_(feasible_indices, restart_value=0.0)
+        return cmp_state, lagrangian_store
