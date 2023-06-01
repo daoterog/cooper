@@ -1,6 +1,6 @@
 import functools
 from enum import Enum
-from typing import Literal, Optional, Tuple
+from typing import Literal, Optional, Tuple, Union
 
 import torch
 
@@ -95,7 +95,6 @@ class Formulation:
     def compute_lagrangian_contribution(
         self, multiplier_value: torch.Tensor, constraint_state: ConstraintState
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-
         weighted_violation_for_primal = compute_primal_weighted_violation(multiplier_value, constraint_state)
 
         if self.formulation_type == "penalized":
@@ -122,7 +121,7 @@ def compute_primal_augmented_lagrangian_penalty(
     multiplier_value: torch.Tensor,
     constraint_state: ConstraintState,
     augmented_lagrangian_scheduler: torch.optim.lr_scheduler._LRScheduler,
-) -> Optional[float | torch.Tensor]:
+) -> Optional[Union[float, torch.Tensor]]:
     """Computes the augmented Lagrangian penalty, while preserving the gradient for the
     primal variables.
 
@@ -181,7 +180,6 @@ class AugmentedLagrangianFormulation:
     def compute_lagrangian_contribution(
         self, multiplier_value: torch.Tensor, constraint_state: ConstraintState
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-
         raise NotImplementedError("This formulation is not yet tested.")
 
         weighted_violation_for_primal = compute_primal_weighted_violation(multiplier_value, constraint_state)
